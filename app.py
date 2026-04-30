@@ -23,7 +23,46 @@ index: faiss.IndexFlatIP = None     # inner-product (cosine) FAISS index
 
 # Number of parallel workers for index building.
 # ONNX Runtime releases the GIL during inference, so these threads run truly in parallel.
-_INDEX_WORKERS = min(os.cpu_count() or 1, 8)
+# Reserve 2 logical processors for the OS and the Tkinter UI thread; use the rest for indexing.
+# This scales automatically: 4-core laptop → 2 workers, 28-core server → 26 workers, etc.
+_LOGICAL_PROCESSORS = os.cpu_count() or 1
+_INDEX_WORKERS = max(1, _LOGICAL_PROCESSORS - 2)
+
+
+def get_cpu_info() -> dict:
+    """Return physical sockets, cores per socket, and logical processors."""
+    import subprocess, re
+    info = {
+        "sockets": 0,
+        "cores_per_socket": 0,
+        "logical_processors": os.cpu_count() or 0,
+        "name": "Unknown",
+    }
+    try:
+        out = subprocess.check_output(
+            ["wmic", "cpu", "get",
+             "Name,NumberOfCores,NumberOfLogicalProcessors",
+             "/format:csv"],
+            text=True, stderr=subprocess.DEVNULL
+        )
+        rows = [l.strip() for l in out.splitlines() if l.strip() and "Node" not in l]
+        if rows:
+            # CSV columns: Node,Name,NumberOfCores,NumberOfLogicalProcessors
+            sockets, total_cores = 0, 0
+            for row in rows:
+                parts = row.split(",")
+                if len(parts) >= 4:
+                    sockets += 1
+                    try:
+                        total_cores = int(parts[2])
+                    except ValueError:
+                        pass
+                    info["name"] = parts[1].strip()
+            info["sockets"] = sockets
+            info["cores_per_socket"] = total_cores
+    except Exception:
+        pass
+    return info
 
 
 # ─── InsightFace helpers ──────────────────────────────────────────────────────
@@ -183,6 +222,9 @@ class App(tk.Tk):
         self.lbl_index = tk.Label(toolbar, text="Index: –", anchor="w")
         self.lbl_index.pack(side=tk.LEFT, padx=12)
 
+        self.lbl_cpu = tk.Label(toolbar, text="CPU: –", anchor="w", fg="#555")
+        self.lbl_cpu.pack(side=tk.LEFT, padx=4)
+
         # Main pane: query image (left) + results (right)
         pane = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashwidth=6)
         pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
@@ -263,6 +305,23 @@ class App(tk.Tk):
     def _on_ready(self):
         n = index.ntotal if index else 0
         self.lbl_index.config(text=f"Index: {n} face(s) from {len(labels)} image(s)")
+
+        cpu = get_cpu_info()
+        cpu_text = (
+            f"CPU: {cpu['name']}  |  "
+            f"{cpu['sockets']} socket  •  "
+            f"{cpu['cores_per_socket']} cores/socket  •  "
+            f"{cpu['logical_processors']} logical processors  |  "
+            f"Workers: {_INDEX_WORKERS}"
+        )
+        self.lbl_cpu.config(text=cpu_text)
+
+        print(f"[cpu] {cpu['name']}")
+        print(f"[cpu] Sockets: {cpu['sockets']}  |  "
+              f"Cores/socket: {cpu['cores_per_socket']}  |  "
+              f"Logical processors: {cpu['logical_processors']}  |  "
+              f"Index workers: {_INDEX_WORKERS}")
+
         self.btn_rebuild.config(state=tk.NORMAL)
         self.btn_search.config(state=tk.NORMAL)
         self._status("Ready.")
