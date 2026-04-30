@@ -29,8 +29,19 @@ _INDEX_WORKERS = min(os.cpu_count() or 1, 8)
 # ─── InsightFace helpers ──────────────────────────────────────────────────────
 
 def load_model() -> FaceAnalysis:
-    """Load InsightFace buffalo_l model (downloads on first run)."""
-    app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+    """Load InsightFace buffalo_l model (downloads on first run).
+
+    intra/inter_op_num_threads are set to 1 so that ONNX Runtime does not
+    internally parallelise a single inference call. Core distribution is
+    handled externally by ThreadPoolExecutor in build_index(), which means
+    N worker threads each occupy 1 core cleanly with no over-subscription.
+    """
+    import onnxruntime as ort
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 1   # one thread per ONNX op
+    opts.inter_op_num_threads = 1   # one thread across ops
+    app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"],
+                       session_options=opts)
     app.prepare(ctx_id=0, det_thresh=0.3, det_size=(640, 640))
     return app
 
