@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -19,6 +20,10 @@ face_app: FaceAnalysis = None
 embeddings: list[np.ndarray] = []   # parallel to `labels`
 labels: list[str] = []              # filenames
 index: faiss.IndexFlatIP = None     # inner-product (cosine) FAISS index
+
+# Number of parallel workers for index building.
+# ONNX Runtime releases the GIL during inference, so these threads run truly in parallel.
+_INDEX_WORKERS = min(os.cpu_count() or 1, 8)
 
 
 # ─── InsightFace helpers ──────────────────────────────────────────────────────
@@ -58,20 +63,45 @@ def get_embedding(img_path: str) -> np.ndarray | None:
 
 # ─── Index building ───────────────────────────────────────────────────────────
 
-def build_index() -> tuple[list, list, faiss.IndexFlatIP]:
-    """Read every image in PICS_DIR, extract embeddings, build FAISS index."""
+def _embed_one(fname: str) -> tuple[str, np.ndarray | None]:
+    """Worker: decode and embed a single image. Safe to call from multiple threads
+    because ONNX Runtime's InferenceSession.run() releases the GIL and is thread-safe."""
+    path = os.path.join(PICS_DIR, fname)
+    return fname, get_embedding(path)
+
+
+def build_index(progress_cb=None) -> tuple[list, list, faiss.IndexFlatIP]:
+    """Read every image in PICS_DIR in parallel, extract embeddings, build FAISS index.
+
+    Args:
+        progress_cb: optional callable(done: int, total: int) called after each
+                     image completes — suitable for updating a progress indicator.
+    """
     supported = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     files = [
         f for f in os.listdir(PICS_DIR)
         if os.path.splitext(f)[1].lower() in supported
     ]
 
+    total = len(files)
+    done = 0
+    # Map filename -> embedding, populated as futures complete (out-of-order)
+    result_map: dict[str, np.ndarray | None] = {}
+
+    with ThreadPoolExecutor(max_workers=_INDEX_WORKERS) as pool:
+        futures = {pool.submit(_embed_one, fname): fname for fname in files}
+        for future in as_completed(futures):
+            fname, emb = future.result()
+            result_map[fname] = emb
+            done += 1
+            if progress_cb:
+                progress_cb(done, total)
+
+    # Re-order results to match the original file listing (deterministic index order)
     embs: list[np.ndarray] = []
     names: list[str] = []
-
     for fname in files:
-        path = os.path.join(PICS_DIR, fname)
-        emb = get_embedding(path)
+        emb = result_map.get(fname)
         if emb is not None:
             embs.append(emb)
             names.append(fname)
@@ -199,7 +229,14 @@ class App(tk.Tk):
             self.after(0, lambda: self._status(f"Model loaded in {model_secs:.2f}s — building index…"))
 
             t2 = time.perf_counter()
-            embeddings, labels, index = build_index()
+
+            def _index_progress(done, total):
+                self.after(0, lambda: self._status(
+                    f"Building index… {done}/{total} images  "
+                    f"({_INDEX_WORKERS} parallel workers)"
+                ))
+
+            embeddings, labels, index = build_index(progress_cb=_index_progress)
             t3 = time.perf_counter()
             index_secs = t3 - t2
 
@@ -230,7 +267,12 @@ class App(tk.Tk):
     def _do_rebuild(self):
         global embeddings, labels, index
         try:
-            embeddings, labels, index = build_index()
+            def _rebuild_progress(done, total):
+                self.after(0, lambda: self._status(
+                    f"Rebuilding index… {done}/{total} images  "
+                    f"({_INDEX_WORKERS} parallel workers)"
+                ))
+            embeddings, labels, index = build_index(progress_cb=_rebuild_progress)
             self.after(0, self._on_ready)
         except Exception as exc:
             self.after(0, lambda: self._status(f"Rebuild error: {exc}"))
